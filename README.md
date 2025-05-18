@@ -15,3 +15,39 @@ Research Assistant Agent
                           └───────────────────┘
                                      │
                     UI polls ⇒   live INFO log stream
+
+
+research-guild/
+├ agents/                single-task LLM agents (fetcher, summariser…)
+├ services/
+│   ├ storage.py         DB connection + table definitions
+│   └ vector.py          (placeholder for embeddings)
+├ ui/
+│   └ app.py             Streamlit frontend (pure HTTP)
+├ guild_graph.py         LangGraph orchestrator reused by the worker
+├ api.py                 REST API  (jobs, logs, results, admin/clear)
+├ tasks.py               Celery task wrapper  ➜ calls guild_graph
+├ Dockerfile             builds one image for api + worker + streamlit
+├ docker-compose.yml     spins up: redis · api · worker · streamlit
+├ requirements.txt       pip dependencies
+└ README.md              (this file)
+
+
+## How to Run
+
+```
+git clone https://github.com/you/research-guild.git
+cd research-guild
+
+# 1. secrets
+cp .env.example .env           # add your OPENAI_API_KEY, optional REDIS_URL
+
+# 2. make data dir (git-ignored)
+mkdir -p data
+
+# 3. build + run everything
+docker compose up --build
+```
+
+- UI: http://localhost:8501
+- API: API: http://localhost:8000 
