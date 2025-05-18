@@ -1,8 +1,9 @@
 """Research Guild Orchestrator – LangGraph implementation
 
-Refactored to use **StateGraph** (the canonical builder in the
-`langgraph.graph` module) to avoid the `ImportError: cannot import name 'Graph'`
-that occurs on current LangGraph versions ≥ 0.4.x.
+* `FetcherAgent` returns a list of new paper dicts in `state["outputs"]`.
+* `SummariserAgent` downloads each PDF, creates a concise summary with GPT, and
+  replaces `state["outputs"]` with the enriched list (now including
+  `summary`).
 
 ### Quick test
 ```
@@ -14,12 +15,17 @@ from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, TypedDict
-
 from langgraph.graph import StateGraph, START, END
-
 from agents.fetcher import FetcherAgent
+from agents.summariser import SummariserAgent
+from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+# logging.basicConfig(
+#     level=logging.DEBUG,                     # DEBUG, INFO, WARNING…
+#     format="%(levelname)s | %(name)s | %(message)s",
+# )
+# load_dotenv()
 
 
 class GuildState(TypedDict):
@@ -56,16 +62,30 @@ class ResearchGuildGraph:
         """Create StateGraph → compile → return runnable."""
         builder = StateGraph(GuildState)
 
-        fetcher = FetcherAgent(
+        # ---------- Fetcher node ---------- #
+        fetch_agent = FetcherAgent(
             topic=self.topic, since_days=self.since_days, max_results=self.max_results
         )
 
-        # 1️⃣ Nodes
-        builder.add_node("fetch", lambda state: {"outputs": fetcher.run(None, {})[0]})
+        def fetch_node(state: GuildState) -> GuildState:
+            papers, _ = fetch_agent.run(None, {})
+            return {"outputs": papers}
 
-        # 2️⃣ Edges: START → fetch → END
+        builder.add_node("fetch", fetch_node)
+
+        # ---------- Summariser node ---------- #
+        summariser_agent = SummariserAgent()
+
+        def summarise_node(state: GuildState) -> GuildState:
+            summarised, _ = summariser_agent.run(state["outputs"], {})
+            return {"outputs": summarised}
+
+        builder.add_node("summarise", summarise_node)
+
+        # ---------- Edges ---------- #
         builder.add_edge(START, "fetch")
-        builder.add_edge("fetch", END)
+        builder.add_edge("fetch", "summarise")
+        builder.add_edge("summarise", END)
 
         # 3️⃣ Compile
         return builder.compile()

@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  guild-core:
+    build: .
+    container_name: research-assistant-agent
+    command: ["python", "guild_graph.py"]
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  guild-ui:
+    build: .
+    container_name: research-assistant-agent-ui
+    command: ["streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.enableCORS", "false"]
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    ports:
+      - "8501:8501"
+    depends_on:
+      - guild-core
+    restart: unless-stopped
+
+volumes:
+  db_data: {}

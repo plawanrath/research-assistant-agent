@@ -4,6 +4,7 @@ meta = MetaData()
 papers = Table("papers", meta,
     Column("id", Text, primary_key=True),
     Column("title", Text), Column("summary", Text),
+    Column("pdf_url", Text),
     Column("embedding", Text)  # JSON list
 )
 meta.create_all(engine)
