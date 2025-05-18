@@ -1,6 +1,6 @@
 Research Assistant Agent
 
-
+```
                 ┌───────────────┐
    text_input → │  Streamlit UI │─┐
                 └───────────────┘ │  starts worker-thread
@@ -15,8 +15,10 @@ Research Assistant Agent
                           └───────────────────┘
                                      │
                     UI polls ⇒   live INFO log stream
+```
 
 
+```
 research-guild/
 ├ agents/                single-task LLM agents (fetcher, summariser…)
 ├ services/
@@ -31,6 +33,7 @@ research-guild/
 ├ docker-compose.yml     spins up: redis · api · worker · streamlit
 ├ requirements.txt       pip dependencies
 └ README.md              (this file)
+```
 
 
 ## How to Run
