@@ -161,6 +161,7 @@ class FetcherAgent:
                         summary="",
                         pdf_url=it["pdf_url"],
                         embedding=json.dumps([]),
+                        created_at=datetime.utcnow(),  
                     )
                     .prefix_with("OR IGNORE")
                 )

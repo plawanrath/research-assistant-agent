@@ -17,7 +17,10 @@ import logging
 from typing import Any, Dict, List, TypedDict
 from langgraph.graph import StateGraph, START, END
 from agents.fetcher import FetcherAgent
+from agents.planner import PlannerAgent
 from agents.summariser import SummariserAgent
+from agents.critic import CriticAgent
+from agents.trend import TrendAnalyzerAgent
 from dotenv import load_dotenv
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -82,10 +85,38 @@ class ResearchGuildGraph:
 
         builder.add_node("summarise", summarise_node)
 
+        # ---------- critic node ---------- #
+        critic_agent = CriticAgent()
+        def critic_node(state):
+            critiqued, _ = critic_agent.run(state["outputs"], {})
+            state["outputs"] = critiqued
+            return state
+        builder.add_node("critic", critic_node)
+
+        # ---------- trends node ---------- #
+        trend_agent = TrendAnalyzerAgent()
+        def trend_node(state):
+            trend_agent.run(None, {})
+            return state
+        
+        builder.add_node("trend", trend_node)
+
+        # ---------- planner node ---------- #
+        planner_agent = PlannerAgent()
+
+        def planner_node(state):
+            planner_agent.run(None, {})
+            return state
+
+        builder.add_node("planner", planner_node)
+
         # ---------- Edges ---------- #
         builder.add_edge(START, "fetch")
         builder.add_edge("fetch", "summarise")
-        builder.add_edge("summarise", END)
+        builder.add_edge("summarise", "critic")
+        builder.add_edge("critic", "trend")
+        builder.add_edge("trend", "planner") 
+        builder.add_edge("planner", END)
 
         # 3️⃣ Compile
         return builder.compile()

@@ -9,3 +9,5 @@ tiktoken
 sqlalchemy
 python-dotenv
 PyPDF2
+scikit-learn 
+numpy
