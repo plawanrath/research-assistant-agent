@@ -12,3 +12,9 @@ PyPDF2
 scikit-learn 
 numpy
 tiktoken
+fastapi
+uvicorn[standard]
+celery[redis]
+pydantic
+aiofiles
+requests

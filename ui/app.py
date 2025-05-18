@@ -1,173 +1,217 @@
-"""
-Streamlit dashboard for the Personal Research Guild
----------------------------------------------------
-* Lists all papers in `guild.db`
-* Lets you filter by title / date / min-scores
-* Expands each row to reveal:
-    – Summary (bullets)
-    – Critique paragraph
-    – Three 0-10 score “metric” widgets
-Run:
-    streamlit run ui/app.py
-"""
-
+# ui/app.py
 from __future__ import annotations
-import json, sqlite3, pandas as pd, streamlit as st
-from datetime import datetime
-
-DB = "guild.db"
+import os, time, json, requests, pandas as pd, streamlit as st
+import ast
 
 # ------------------------------------------------------------------ #
-# Helpers (cached)                                                   #
+# Config
 # ------------------------------------------------------------------ #
-@st.cache_data(show_spinner=False)
-def load_papers() -> pd.DataFrame:
-    conn = sqlite3.connect(DB)
-    df = pd.read_sql(
-        """SELECT id, title, summary, pdf_url,
-                  IFNULL(score_novelty,'')   AS novelty,
-                  IFNULL(score_method,'')    AS method,
-                  IFNULL(score_relevance,'') AS relevance,
-                  IFNULL(critique,'')        AS critique
-           FROM papers ORDER BY created_at DESC""",
-        conn,
-    )
-    conn.close()
-    for c in ["novelty", "method", "relevance"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
+BACKEND = os.getenv("BACKEND", "http://localhost:8000")   # docker gives http://api:8000
 
+# universal rerun helper (works on old / new Streamlit)
+def _rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
 
-@st.cache_data(show_spinner=False)
-def load_trends() -> pd.DataFrame:
-    conn = sqlite3.connect(DB)
-    tdf = pd.read_sql(
-        "SELECT trend_label, count, growth, paper_ids FROM trends ORDER BY id",
-        conn,
-    )
-    conn.close()
-    return tdf
+# ---------- tiny HTTP helpers ------------------------------------- #
+def fetch_status(job_id: str) -> dict:
+    try:
+        r = requests.get(f"{BACKEND}/jobs/{job_id}", timeout=10)
+        return r.json() if r.status_code == 200 else {
+            "status": "error", "logs": f"{r.status_code} {r.text[:200]}"}
+    except Exception as e:
+        return {"status": "error", "logs": str(e)}
 
-@st.cache_data(show_spinner=False)
-def load_plan() -> str | None:
-    conn = sqlite3.connect(DB)
-    row = conn.execute("SELECT plan_text FROM plans ORDER BY id DESC LIMIT 1;").fetchone()
-    conn.close()
-    return row[0] if row else None
+def fetch_result(job_id: str) -> dict | None:
+    try:
+        r = requests.get(f"{BACKEND}/jobs/{job_id}/result", timeout=10)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+def fetch_jobs(status: str | None = "done") -> list[dict]:
+    try:
+        url = f"{BACKEND}/jobs" + (f"?status={status}" if status else "")
+        return requests.get(url, timeout=10).json()
+    except Exception:
+        return []
 
 # ------------------------------------------------------------------ #
-# Title + Refresh                                                    #
+# UI – inputs
 # ------------------------------------------------------------------ #
-st.title("📚 Personal Research Guild")
-if "last_loaded" not in st.session_state:
-    st.session_state.last_loaded = datetime.utcnow()
+st.title("🔎 Personal Research Guild")
 
-if st.sidebar.button("↻ Refresh data"):
-    load_papers.clear()   # clear Streamlit cache
-    load_trends.clear()
-    st.session_state.last_loaded = datetime.utcnow()
+col_topic, col_days, col_max = st.columns([3, 1, 1])
+topic = col_topic.text_input("Topic", "ai safety")
+days  = col_days.number_input("Days", 1, 30, 2, step=1)
+max_p = col_max.number_input("Max papers", 5, 100, 25, step=5)
 
-papers_df = load_papers()
-trends_df = load_trends()
+btn_run_col, btn_clear_col = st.columns(2)
+with btn_run_col:
+    run_btn = st.button("🚀 Run pipeline", use_container_width=True)
+with btn_clear_col:
+    clear_btn = st.button("🗑 Clear Data", use_container_width=True)
 
-st.caption(f"*Data last loaded: {st.session_state.last_loaded.isoformat(timespec='seconds')}*")
+log_box = st.empty()
 
 # ------------------------------------------------------------------ #
-# 🔥 Trending topics                                                 #
+# Session keys
 # ------------------------------------------------------------------ #
-if not trends_df.empty:
-    st.subheader("🔥 Trending topics (last 7 days)")
+state = st.session_state
+for key in ("job_id", "ready", "results"):
+    state.setdefault(key, None)
 
-    # order by growth descending
-    trends_df = trends_df.sort_values("growth", ascending=False, ignore_index=True)
+# ------------------------------------------------------------------ #
+# Clear-data button
+# ------------------------------------------------------------------ #
+if clear_btn:
+    r = requests.post(f"{BACKEND}/admin/clear")
+    if r.status_code == 204:
+        st.success("Tables cleared.")
+        for k in ("job_id", "ready", "results"):
+            if k in state: state.pop(k)
+        _rerun()
+    else:
+        st.error(f"Backend error: {r.status_code}")
 
-    for _, tr in trends_df.iterrows():
-        label   = tr["trend_label"]
-        cnt     = int(tr["count"])
-        growth  = tr["growth"]
-        sign    = "+" if growth >= 0 else ""
-        paper_ids = json.loads(tr["paper_ids"])
+# ------------------------------------------------------------------ #
+# Run-pipeline button
+# ------------------------------------------------------------------ #
+if run_btn:
+    payload = {"topic": topic, "days": int(days), "max_results": int(max_p)}
+    r = requests.post(f"{BACKEND}/jobs", json=payload)
+    if r.status_code == 202:
+        state.job_id = r.json()["job_id"]
+        state.ready  = None
+        state.results = None
+        _rerun()
+    else:
+        st.error(f"Backend error: {r.status_code}\n{r.text}")
 
-        with st.expander(f"{label} — {cnt} papers  ({sign}{growth*100:.0f} %)", expanded=False):
-            # newest-first order was saved by TrendAnalyzer
-            subset = papers_df[papers_df["id"].isin(paper_ids)].set_index("id").loc[paper_ids]
+# ------------------------------------------------------------------ #
+# Polling / live logs
+# ------------------------------------------------------------------ #
+job_id = state.get("job_id")
+if job_id and not state.results:
+    status = fetch_status(job_id)
+    st.text_area("Logs", status.get("logs", ""), height=200)
+    st.info(f"Job `{job_id}` • status: **{status['status']}**")
 
-            for _, row in subset.iterrows():
-                # TOP-LEVEL TOGGLE – avoids nested expanders
-                paper_id = row.name 
-                if st.toggle(row["title"], key=f"t-{paper_id}"):
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Novelty",    row.novelty if pd.notna(row.novelty) else "—")
-                    c2.metric("Methodology",row.method  if pd.notna(row.method)  else "—")
-                    c3.metric("Relevance",  row.relevance if pd.notna(row.relevance) else "—")
+    if status["status"] in ("running", "queued"):
+        time.sleep(5)
+        _rerun()
 
-                    st.markdown("**Summary**")
-                    st.markdown(row.summary or "_(No summary yet)_")
+    elif status["status"] == "done":
+        if not state.ready:
+            state.ready = True      # first time we see done
+            _rerun()
+        if st.button("📂 View Results"):
+            res = fetch_result(job_id)
+            if res:
+                state.results = res
+                _rerun()
 
-                    st.markdown(f"[🔗 Open paper / PDF]({row.pdf_url})") 
+    elif status["status"] == "failed":
+        st.error(status.get("error", "Unknown backend error"))
 
-                    st.markdown("**Critique**")
-                    st.markdown(row.critique or "_(No critique yet)_")
+    st.stop()   # don’t show other sections while waiting / ready
 
-                    if st.toggle("Raw JSON", key=f"raw-{paper_id}"):
-                        st.json(row.dropna().to_dict())
-
-                    st.markdown("---")
-
+# ------------------------------------------------------------------ #
+# Past Jobs section
+# ------------------------------------------------------------------ #
+jobs_done = fetch_jobs()
+if jobs_done:
+    st.subheader("🗂 Past Jobs")
+    for j in jobs_done:
+        c1, c2, c3 = st.columns([3, 1, 1])
+        c1.markdown(f"`{j['id']}`  \n*{j['topic'][:40]}*")
+        c2.write(j["status"])
+        if c3.button("View Results", key=f"view-{j['id']}"):
+            res = fetch_result(j["id"])
+            if res:
+                state.job_id  = j["id"]
+                state.results = res
+                state.ready   = True
+                _rerun()
     st.divider()
 
 # ------------------------------------------------------------------ #
-#   Planner Block After Trends                                       #
+# Render results if present
 # ------------------------------------------------------------------ #
+if state.results:
+    res = state.results
 
-plan_text = load_plan()
-if plan_text:
+    # ---------- Reading Plan ----------
     st.subheader("📅 Suggested Reading Queue")
-    st.markdown(plan_text, unsafe_allow_html=True)
-    st.divider()
+    st.markdown(res["reading_plan"])
 
-# ------------------------------------------------------------------ #
-# 🔎  All papers (filterable)                                        #
-# ------------------------------------------------------------------ #
-with st.sidebar:
-    st.header("Filters – All Papers")
-    title_q  = st.text_input("Title contains")
-    min_nov  = st.slider("Min Novelty",    0, 10, 0)
-    min_meth = st.slider("Min Methodology",0, 10, 0)
-    min_rel  = st.slider("Min Relevance",  0, 10, 0)
+    # ---------- Trends ----------
+    raw_trends = json.loads(res["trends_json"])
 
-mask = (
-    (papers_df["title"].str.contains(title_q, case=False, regex=False) if title_q else True)
-    & (papers_df["novelty"].fillna(10)   >= min_nov)
-    & (papers_df["method"].fillna(10)    >= min_meth)
-    & (papers_df["relevance"].fillna(10) >= min_rel)
-)
-filtered_df = papers_df[mask]
-st.subheader(f"🗂 All Papers  —  {len(filtered_df)} shown / {len(papers_df)} total")
+    # legacy snapshots: each element may be a string that looks like a Python dict
+    parsed = []
+    for item in raw_trends:
+        if isinstance(item, str):
+            try:
+                parsed.append(ast.literal_eval(item))   # "{'trend_label': ...}" → dict
+            except Exception:
+                continue                                # skip if it still can’t parse
+        elif isinstance(item, dict):
+            parsed.append(item)
 
-for _, row in filtered_df.iterrows():
-    paper_id = row["id"]
-    if st.toggle(row["title"], key=f"all-{paper_id}"):
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Novelty",    row.novelty if pd.notna(row.novelty) else "—")
-        c2.metric("Methodology",row.method  if pd.notna(row.method)  else "—")
-        c3.metric("Relevance",  row.relevance if pd.notna(row.relevance) else "—")
+    tr_df = pd.DataFrame(parsed)
 
-        st.markdown("**Summary**")
-        st.markdown(row.summary or "_(No summary yet)_")
+    papers_df = pd.DataFrame(json.loads(res["papers_json"]))
+    for c in ("score_novelty", "score_method", "score_relevance"):
+        if c in papers_df.columns:
+            papers_df[c] = pd.to_numeric(papers_df[c], errors="coerce")
 
-        st.markdown(f"[🔗 Open paper / PDF]({row.pdf_url})") 
+    if not tr_df.empty and not papers_df.empty:
+        for _, tr in tr_df.iterrows():
+            label  = tr.get("trend_label") or tr.get("label") or "—"
+            cnt    = int(tr.get("count", 0))
+            growth = float(tr.get("growth", 0))
+            ids_raw = tr.get("paper_ids", "[]")
 
-        st.markdown("**Critique**")
-        st.markdown(row.critique or "_(No critique yet)_")
+            # paper_ids is stored as JSON string
+            try:
+                ids = json.loads(ids_raw) if isinstance(ids_raw, str) else ids_raw
+            except Exception:
+                ids = []
+            with st.expander(f"{label} — {cnt} papers ({'+' if growth>=0 else ''}{growth*100:.0f} %)"):
+                id_col = "id" if "id" in papers_df.columns else (
+                        "paper_id" if "paper_id" in papers_df.columns else None)
 
-        if st.toggle("Raw JSON", key=f"all-raw-{paper_id}"):
-            st.json(row.dropna().to_dict())
+                if id_col:
+                    group = papers_df[papers_df[id_col].isin(ids)].set_index(id_col)
+                    # re-order to match ids list, keeping only those found
+                    group = group.loc[[i for i in ids if i in group.index]]
+                else:
+                    # extreme fallback: nothing matches
+                    group = pd.DataFrame()
+                for _, row in group.iterrows():
+                    pid = row.name
+                    if st.toggle(row.title, key=f"trend-{pid}"):
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Novelty",     row.score_novelty   or "—")
+                        c2.metric("Methodology", row.score_method    or "—")
+                        c3.metric("Relevance",   row.score_relevance or "—")
+                        st.markdown("**Summary**");  st.markdown(row.summary or "_No summary_")
+                        st.markdown(f"[🔗 PDF]({row.pdf_url})")
+                        if st.toggle("Raw JSON", key=f"raw-{pid}"):
+                            st.json(row.dropna().to_dict())
+                        st.markdown("---")
+        st.divider()
 
-        st.markdown("---")
+    # ---------- Papers quick table ----------
+    if not papers_df.empty:
+        st.subheader("📄 All papers")
 
-# ------------------------------------------------------------------ #
-st.info(
-    "**Tip:** run `python guild_graph.py` (or the Docker service) to fetch → "
-    "summarise → critique → update trends. Then click **Refresh data**."
-)
+        # choose safe columns that actually exist
+        cols = [c for c in ("title", "created_at") if c in papers_df.columns]
+        if not cols:                          # fallback if both missing
+            cols = papers_df.columns[:2]      # show first two columns
+
+        st.dataframe(papers_df[cols])

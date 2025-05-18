@@ -1,29 +1,45 @@
 version: "3.9"
 
+# docker-compose automatically loads .env at the project root
 services:
-  guild-core:
-    build: .
-    container_name: research-assistant-agent
-    command: ["python", "guild_graph.py"]
-    env_file:
-      - .env
-    volumes:
-      - .:/app
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
 
-  guild-ui:
+  api:
     build: .
-    container_name: research-assistant-agent-ui
-    command: ["streamlit", "run", "ui/app.py", "--server.port", "8501", "--server.enableCORS", "false"]
-    env_file:
-      - .env
+    env_file: .env
+    environment:
+      - REDIS_URL=${REDIS_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
-      - .:/app
+      - ./data:/app/data          # ← mount directory
+    depends_on: [redis]
+    ports:
+      - "8000:8000"
+
+  worker:
+    build: .
+    command: celery -A tasks.celery_app worker --loglevel=info
+    env_file: .env
+    environment:
+      - REDIS_URL=${REDIS_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./data:/app/data          # ← same mount
+    depends_on: [redis, api]
+
+  streamlit:
+    build: .
+    command: >
+      streamlit run ui/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+    env_file: .env
+    environment:
+      - BACKEND=${BACKEND_URL:-http://api:8000}
+    volumes:
+      - ./data:/app/data          # ← so UI can read the DB if needed
+    depends_on: [api]
     ports:
       - "8501:8501"
-    depends_on:
-      - guild-core
-    restart: unless-stopped
-
-volumes:
-  db_data: {}
