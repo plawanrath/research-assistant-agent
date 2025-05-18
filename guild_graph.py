@@ -1,134 +1,148 @@
-"""Research Guild Orchestrator – LangGraph implementation
+"""
+guild_graph.py
+==============
 
-* `FetcherAgent` returns a list of new paper dicts in `state["outputs"]`.
-* `SummariserAgent` downloads each PDF, creates a concise summary with GPT, and
-  replaces `state["outputs"]` with the enriched list (now including
-  `summary`).
+•  ResearchGuildGraph(topic)  – same class as before (no hard-coded topic)
+•  run_pipeline(topic, log_queue=None) – helper that executes the graph
+   and, if a `queue.Queue` is provided, streams every root-logger INFO line
+   into it.  A "__DONE__" sentinel marks completion.
 
-### Quick test
-```
-python guild_graph.py                # prints count + first titles
-```
+This file can still be executed directly:
+
+    python guild_graph.py --topic "ai safety" --days 2 --max 25
 """
 
 from __future__ import annotations
-
-import logging
+import argparse, logging, queue
 from typing import Any, Dict, List, TypedDict
+
 from langgraph.graph import StateGraph, START, END
 from agents.fetcher import FetcherAgent
-from agents.planner import PlannerAgent
 from agents.summariser import SummariserAgent
 from agents.critic import CriticAgent
 from agents.trend import TrendAnalyzerAgent
-from dotenv import load_dotenv
+from agents.planner import PlannerAgent
 
+# ------------------------------------------------------------------ #
+# Logging config (root logger)                                       #
+# ------------------------------------------------------------------ #
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-# logging.basicConfig(
-#     level=logging.DEBUG,                     # DEBUG, INFO, WARNING…
-#     format="%(levelname)s | %(name)s | %(message)s",
-# )
-# load_dotenv()
 
 
+# ------------------------------------------------------------------ #
+# Typed state passed through LangGraph                               #
+# ------------------------------------------------------------------ #
 class GuildState(TypedDict):
-    """Minimal state schema for initial build.
-
-    We keep one key – `outputs` – which accumulates the list of new paper
-    dictionaries returned by the Fetcher.  Later agents (summaries, scores,
-    etc.) will extend this schema.
-    """
-
     outputs: List[Dict[str, Any]]
 
 
+# ------------------------------------------------------------------ #
+# Core graph wrapper                                                 #
+# ------------------------------------------------------------------ #
 class ResearchGuildGraph:
-    """Encapsulates the LangGraph powering the Personal Research Guild."""
-
-    # ------------------------------------------------------------------ #
     def __init__(self, topic: str, *, since_days: int = 2, max_results: int = 25):
         self.topic = topic
         self.since_days = since_days
         self.max_results = max_results
-
         self._compiled = self._build_and_compile()
 
-    # ------------------------------------------------------------------ #
     def run(self) -> List[Dict[str, Any]]:
-        """Execute the graph; return list of new papers from Fetcher."""
-        state_in: GuildState = {"outputs": []}
-        state_out: GuildState = self._compiled.invoke(state_in)
-        return state_out["outputs"]
+        start_state: GuildState = {"outputs": []}
+        end_state: GuildState = self._compiled.invoke(start_state)
+        return end_state["outputs"]
 
-    # ------------------------------------------------------------------ #
+    # -------------------- internal builders -------------------- #
     def _build_and_compile(self):
-        """Create StateGraph → compile → return runnable."""
         builder = StateGraph(GuildState)
 
-        # ---------- Fetcher node ---------- #
-        fetch_agent = FetcherAgent(
-            topic=self.topic, since_days=self.since_days, max_results=self.max_results
+        # 1️⃣ Fetch
+        fetcher = FetcherAgent(self.topic, since_days=self.since_days, max_results=self.max_results)
+        builder.add_node(
+            "fetch",
+            lambda _state: {"outputs": fetcher.run(None, {})[0]},
         )
 
-        def fetch_node(state: GuildState) -> GuildState:
-            papers, _ = fetch_agent.run(None, {})
-            return {"outputs": papers}
+        # 2️⃣ Summarise
+        summariser = SummariserAgent()
+        builder.add_node(
+            "summarise",
+            lambda state: {"outputs": summariser.run(state["outputs"], {})[0]},
+        )
 
-        builder.add_node("fetch", fetch_node)
+        # 3️⃣ Critic
+        critic = CriticAgent()
+        builder.add_node(
+            "critic",
+            lambda state: {"outputs": critic.run(state["outputs"], {})[0]},
+        )
 
-        # ---------- Summariser node ---------- #
-        summariser_agent = SummariserAgent()
+        # 4️⃣ Trend (side-effect only)
+        trend = TrendAnalyzerAgent()
+        builder.add_node(
+            "trend",
+            lambda state: (trend.run(None, {}))[0] or state,  # pass-through
+        )
 
-        def summarise_node(state: GuildState) -> GuildState:
-            summarised, _ = summariser_agent.run(state["outputs"], {})
-            return {"outputs": summarised}
+        # 5️⃣ Planner (side-effect only)
+        planner = PlannerAgent()
+        builder.add_node(
+            "planner",
+            lambda state: (planner.run(None, {}))[0] or state,
+        )
 
-        builder.add_node("summarise", summarise_node)
-
-        # ---------- critic node ---------- #
-        critic_agent = CriticAgent()
-        def critic_node(state):
-            critiqued, _ = critic_agent.run(state["outputs"], {})
-            state["outputs"] = critiqued
-            return state
-        builder.add_node("critic", critic_node)
-
-        # ---------- trends node ---------- #
-        trend_agent = TrendAnalyzerAgent()
-        def trend_node(state):
-            trend_agent.run(None, {})
-            return state
-        
-        builder.add_node("trend", trend_node)
-
-        # ---------- planner node ---------- #
-        planner_agent = PlannerAgent()
-
-        def planner_node(state):
-            planner_agent.run(None, {})
-            return state
-
-        builder.add_node("planner", planner_node)
-
-        # ---------- Edges ---------- #
-        builder.add_edge(START, "fetch")
+        # Edges
+        builder.set_entry_point("fetch")
+        # builder.add_edge(START, "fetch")
         builder.add_edge("fetch", "summarise")
         builder.add_edge("summarise", "critic")
         builder.add_edge("critic", "trend")
-        builder.add_edge("trend", "planner") 
-        builder.add_edge("planner", END)
+        builder.add_edge("trend", "planner")
+        builder.set_finish_point("planner")
+        # builder.add_edge("planner", END)
 
         # 3️⃣ Compile
         return builder.compile()
 
 
-# ---------------------------------------------------------------------- #
-# CLI helper
-# ---------------------------------------------------------------------- #
-if __name__ == "__main__":
-    rg = ResearchGuildGraph(topic="ai safety", since_days=1, max_results=15)
-    papers = rg.run()
+# ------------------------------------------------------------------ #
+# Helper for Streamlit (or any UI)                                   #
+# ------------------------------------------------------------------ #
+def run_pipeline(topic: str, log_q=None, *, days=2, max_results=25):
+    """Execute the pipeline.  Streams INFO lines to log_q and ALWAYS
+    puts '__DONE__' when the PlannerAgent returns (even on crash)."""
+    import logging
 
-    logging.info("✅ Finished – %d new papers", len(papers))
-    for p in papers[:5]:
-        logging.info(" • %s", p.get("title", "<no title>"))
+    qh = None
+    try:
+        if log_q is not None:
+            class QHandler(logging.Handler):
+                def emit(self, rec):
+                    if rec.levelno >= logging.INFO:
+                        log_q.put(self.format(rec))
+            qh = QHandler()
+            qh.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+            logging.getLogger().addHandler(qh)
+
+        graph = ResearchGuildGraph(topic, since_days=days, max_results=max_results)
+        graph.run()
+
+    finally:
+        if log_q is not None:          # <- ALWAYS queue the sentinel
+            log_q.put("__DONE__")
+        if qh:
+            logging.getLogger().removeHandler(qh)
+
+
+# ------------------------------------------------------------------ #
+# CLI entry – still convenient for cron / debugging                  #
+# ------------------------------------------------------------------ #
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Run Personal Research Guild pipeline.")
+    ap.add_argument("--topic", default="ai safety", help="research topic keyword(s)")
+    ap.add_argument("--days", type=int, default=2, help="look back N days")
+    ap.add_argument("--max",  type=int, default=25, help="max results per source")
+    args = ap.parse_args()
+
+    logging.info("▶ Running pipeline for topic: %s", args.topic)
+    run_pipeline(args.topic, None, days=args.days, max_results=args.max)
+    logging.info("✅ Pipeline finished.")

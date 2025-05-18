@@ -1,215 +1,159 @@
-"""SummariserAgent – generates concise summaries for papers fetched by FetcherAgent.
+"""
+SummariserAgent – token-aware version
+------------------------------------
+* Splits text by **tiktoken** tokens (≤4 000 each).
+* Recursively summarises chunks with OpenAI → final 5-line abstract.
+* Falls back to Semantic Scholar or arXiv abstracts when no PDF text.
+* Persists summary into `papers` table.
 
-Highlights
-----------
-* Downloads PDF (or HTML fallback) for each paper.
-* Extracts text via **PyPDF2** (for small-ish PDFs) or HTTP fallback if Semantic
-  Scholar provides a PDF‐direct URL.
-* Chunks text into ~3 000‑token slices, summarises with OpenAI GPT‑4 Turbo using
-  map‑reduce (chunk summary → merge summary).
-* Saves the final summary into SQLite (`services.storage`) in the same row so
-  downstream agents (Critic, Trend) can retrieve it quickly.
-
-Env variables
--------------
-* `OPENAI_API_KEY` – required.
-* `OPENAI_MODEL`   – override model name (default: "gpt-4o-mini").
-* `MAX_TOKENS`     – per‑chunk budget (default: 3 000).
+Env
+----
+OPENAI_API_KEY   – required
+OPENAI_MODEL     – default: gpt-4o-mini
 """
 
 from __future__ import annotations
+import io, logging, os, re, json, requests
+from typing import List, Dict, Any, Optional
 
-import io
-import logging
-import os
-import re
-import textwrap
-from typing import Any, Dict, List, Optional
-
-import openai
-import requests
+import openai, tiktoken
 from PyPDF2 import PdfReader
 from sqlalchemy import update
-
 from services.storage import engine, papers  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-# --------------------------- Config & helpers --------------------------- #
-_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "3000"))
-CHUNK_SIZE_CHARS = 12_000  # rough char heuristic ≈ 3k tokens
+# -------- config -------- #
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+ENC   = tiktoken.encoding_for_model(MODEL)
+TOKENS_PER_CHUNK = 4000          # 4k in, 256 out
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/"
-
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-
-# ---------------------------- Core functions --------------------------- #
-
+# -------- helpers -------- #
 def _download_pdf(url: str) -> bytes | None:
-    """Return PDF bytes or None on error (adds UA header to avoid 403)."""
     try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=40)
-        resp.raise_for_status()
-        if not resp.content.startswith(b"%PDF"):
-            logger.debug("Response from %s is not a PDF", url)
-            return None
-        return resp.content
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=40)
+        r.raise_for_status()
+        return r.content if r.content.startswith(b"%PDF") else None
     except Exception as e:
-        logger.warning("Failed to download %s (%s)", url, e)
+        logger.warning("PDF download failed %s: %s", url, e)
         return None
 
-
-def _extract_text(pdf_bytes: bytes) -> Optional[str]:
+def _pdf_text(data: bytes) -> Optional[str]:
     try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = [p.extract_text() or "" for p in PdfReader(io.BytesIO(data)).pages]
+        return "\n".join(pages)
     except Exception as e:
-        logger.debug("PDF load error: %s", e)
+        logger.debug("PDF parse error: %s", e)
         return None
-    parts = []
-    for p in reader.pages:
-        try:
-            parts.append(p.extract_text() or "")
-        except Exception:
-            continue
-    return "\n".join(parts) if parts else None
 
-
-def _chunk_text(text: str, chunk_chars: int = CHUNK_SIZE_CHARS) -> List[str]:
-    paras = re.split(r"\n{2,}", text)
-    chunks, buf, buf_len = [], [], 0
-    for para in paras:
-        para = para.strip()
-        if not para:
-            continue
-        if buf_len + len(para) > chunk_chars and buf:
-            chunks.append("\n\n".join(buf))
-            buf, buf_len = [], 0
-        buf.append(para)
-        buf_len += len(para)
+def _split_tokens(text: str, max_tok: int = TOKENS_PER_CHUNK) -> List[str]:
+    toks = ENC.encode(text)
+    chunks, buf = [], []
+    for tok in toks:
+        buf.append(tok)
+        if len(buf) >= max_tok:
+            chunks.append(ENC.decode(buf)); buf = []
     if buf:
-        chunks.append("\n\n".join(buf))
+        chunks.append(ENC.decode(buf))
     return chunks
 
-
-def _openai_summarise(text: str, model: str = _OPENAI_MODEL) -> str:
-    sys_prompt = (
-        "You are an expert research assistant. Summarise the following section "
-        "of an academic paper in 3–4 bullet points (plain English, max 120 words)."
-    )
+def _llm(text: str) -> str:
     resp = openai.chat.completions.create(
-        model=model,
+        model=MODEL,
         temperature=0.2,
-        messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": text}],
+        messages=[
+            {"role": "system", "content": "You summarise academic text concisely."},
+            {"role": "user", "content": text},
+        ],
         max_tokens=256,
     )
     return resp.choices[0].message.content.strip()
 
+def _recursive_summarise(chunks: List[str]) -> str:
+    level = 0
+    while True:
+        if len(chunks) == 1:
+            return _llm(chunks[0])
+        level += 1
+        logger.debug("  summarising level %d (%d chunks)", level, len(chunks))
+        summaries = [_llm(c) for c in chunks]
+        merged = "\n\n".join(summaries)
+        if len(ENC.encode(merged)) < TOKENS_PER_CHUNK:
+            return _llm(merged)
+        chunks = _split_tokens(merged)
 
-def _map_reduce_summary(chunks: List[str]) -> str:
-    if not chunks:
-        return "(no text extracted)"
-    intermediate = [_openai_summarise(ch) for ch in chunks]
-    merged = _openai_summarise(
-        "Combine these bullet‑point summaries into an overall 5‑line abstract:\n\n" + "\n\n".join(intermediate)
-    )
-    return merged
-
-
+# --- fallback abstracts --- #
 def _s2_abstract(doi: str) -> Optional[str]:
-    """Fetch abstract text from S2 Graph API if available."""
     try:
-        url = f"{S2_API}{doi}?fields=title,abstract"
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        abs_text = resp.json().get("abstract")
-        return abs_text
+        url = f"{S2_API}{doi}?fields=abstract"
+        r = requests.get(url, timeout=20); r.raise_for_status()
+        return r.json().get("abstract")
     except Exception as e:
-        logger.debug("S2 abstract fetch failed for %s: %s", doi, e)
-        return None
+        logger.debug("S2 abstract fail %s: %s", doi, e); return None
 
-# --------------------------- Fallback helpers --------------------------- #
 def _arxiv_abstract(arxiv_id: str) -> Optional[str]:
-    """Fetch <summary> text from the arXiv Atom feed (id like 2401.06373)."""
     import xml.etree.ElementTree as ET
-
-    url = (
-        "http://export.arxiv.org/api/query?"
-        f"search_query=id:{arxiv_id}&max_results=1"
-    )
+    url = f"http://export.arxiv.org/api/query?search_query=id:{arxiv_id}&max_results=1"
     try:
-        resp = requests.get(
-            url,
-            timeout=20,
-            headers={"User-Agent": "Mozilla/5.0"},
-        )
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        summary_el = root.find("atom:entry/atom:summary", ns)
-        if summary_el is not None and summary_el.text:
-            # Collapse whitespace
-            return re.sub(r"\s+", " ", summary_el.text.strip())
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20); r.raise_for_status()
+        root = ET.fromstring(r.text)
+        ns={"a":"http://www.w3.org/2005/Atom"}
+        el = root.find("a:entry/a:summary", ns)
+        if el is not None and el.text:
+            return re.sub(r"\s+", " ", el.text.strip())
     except Exception as e:
-        logger.debug("ArXiv abstract fetch failed for %s: %s", arxiv_id, e)
+        logger.debug("arXiv abstract fail %s: %s", arxiv_id, e)
     return None
 
-# --------------------------- SummariserAgent --------------------------- #
-
+# --------- agent --------- #
 class SummariserAgent:
-    """Create/attach summary → persist to DB → return enriched dict."""
-
     def run(self, papers_in: List[Dict[str, Any]], state: Dict[str, Any]):
-        logger.info("SummariserAgent: %d papers to process", len(papers_in))
-        outbound: List[Dict[str, Any]] = []
-        for paper in papers_in:
-            pdf_url = paper.get("pdf_url", "")
-            doi = paper.get("doi")
+        logger.info("SummariserAgent: %d papers", len(papers_in))
+        out = []
+        for p in papers_in:
             summary: Optional[str] = None
 
-            # 1️⃣ Try PDF path
-            if pdf_url:
-                pdf_bytes = _download_pdf(pdf_url)
-                if pdf_bytes:
-                    text = _extract_text(pdf_bytes)
+            # 1. PDF path
+            if p.get("pdf_url"):
+                pdf = _download_pdf(p["pdf_url"])
+                if pdf:
+                    text = _pdf_text(pdf)
                     if text:
-                        summary = _map_reduce_summary(_chunk_text(text))
-                    else:
-                        logger.debug("Extraction failed for %s", paper["paper_id"])
-            # 2️⃣ Fallback: semantic‑scholar abstract
-            if summary is None and doi:
-                abs_text = _s2_abstract(doi)
+                        chunks = _split_tokens(text)
+                        summary = _recursive_summarise(chunks)
+
+            # 2. Semantic-Scholar abstract
+            if summary is None and p.get("doi"):
+                abs_text = _s2_abstract(p["doi"])
                 if abs_text:
-                    summary = _openai_summarise(abs_text)
-            # 2️⃣ Fallback: arXiv abstract
-            if summary is None and paper["paper_id"].startswith("arxiv:"):
-                abs_text = _arxiv_abstract(paper["paper_id"].split(":", 1)[1])
+                    summary = _llm(abs_text)
+
+            # 3. arXiv abstract
+            if summary is None and p["paper_id"].startswith("arxiv:"):
+                aid = p["paper_id"].split(":",1)[1]
+                abs_text = _arxiv_abstract(aid)
                 if abs_text:
-                    summary = _openai_summarise(abs_text)
-            # 3️⃣ Persist if we got something
+                    summary = _llm(abs_text)
+
             if summary:
-                paper_with_summary = {**paper, "summary": summary}
-                outbound.append(paper_with_summary)
-                self._persist_summary(paper["paper_id"], summary)
+                p["summary"] = summary
+                out.append(p)
+                self._save(p["paper_id"], summary)
             else:
-                logger.warning("Skip %s – no usable text", paper["paper_id"])
-        return outbound, state
+                logger.warning("Skip %s – no usable text", p["paper_id"])
+        return out, state
 
-    # ------------------------------------------------------------------ #
-    def _persist_summary(self, paper_id: str, summary: str):
+    @staticmethod
+    def _save(pid: str, summary: str):
         with engine.begin() as conn:
-            conn.execute(update(papers).where(papers.c.id == paper_id).values(summary=summary))
-        logger.debug("Saved summary for %s", paper_id)
+            conn.execute(update(papers).where(papers.c.id == pid).values(summary=summary))
+        logger.debug("Saved summary for %s", pid)
 
-
-# --------------------------- CLI smoke test --------------------------- #
+# CLI smoke-test
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
-    test = {
-        "paper_id": "arxiv:2401.00001",
-        "doi": "10.48550/arXiv.2401.00001",
-        "title": "Test Paper",
-        "pdf_url": "https://arxiv.org/pdf/2401.00001.pdf",
-    }
-    out, _ = SummariserAgent().run([test], {})
-    print(textwrap.shorten(str(out), 300))
+    demo = {"paper_id":"arxiv:2401.00001","doi":"10.48550/arXiv.2401.00001",
+            "pdf_url":"https://arxiv.org/pdf/2401.00001.pdf"}
+    print(SummariserAgent().run([demo], {})[0][0]["summary"][:300])
