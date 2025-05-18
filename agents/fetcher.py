@@ -24,67 +24,62 @@ import os
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Tuple, Any
+from typing import Any, Dict, List, Tuple
 
 import requests
-from sqlalchemy import select, insert
+from requests.exceptions import HTTPError
+from sqlalchemy import insert, select
 
-# Local service
 from services.storage import engine, papers  # type: ignore
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
+# ------------------------------- Constants ------------------------------ #
 ARXIV_API = "http://export.arxiv.org/api/query"
 S2_API = "https://api.semanticscholar.org/graph/v1/paper/search"
-
 _DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
 
+# ---------------------------- Helper functions -------------------------- #
 
 def _existing_ids() -> Tuple[set[str], set[str]]:
-    """Return two sets: arxiv_ids and dois already in DB."""
+    """Fetch existing paper IDs from DB, split into arXiv IDs and DOIs."""
     with engine.connect() as conn:
-        res = conn.execute(select(papers.c.id)).fetchall()
-    arxiv_ids, dois = set(), set()
-    for (pid,) in res:
-        if pid.startswith("arxiv:"):
-            arxiv_ids.add(pid)
-        else:
-            dois.add(pid)
-    return arxiv_ids, dois
+        rows = conn.execute(select(papers.c.id)).fetchall()
+    arx, dois = set(), set()
+    for (pid,) in rows:
+        (arx if pid.startswith("arxiv:") else dois).add(pid)
+    return arx, dois
 
 
+# ------------------------------ Agent class ----------------------------- #
 class FetcherAgent:
-    """Simple callable class that fits the LangGraph “node” protocol."""
+    """LangGraph-compatible agent that fetches new papers."""
 
-    def __init__(self, topic: str, since_days: int = 3, max_results: int = 50):
+    def __init__(self, topic: str, *, since_days: int = 3, max_results: int = 50):
         self.topic = topic
         self.since_days = since_days
         self.max_results = max_results
         self.s2_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
 
-    # ---- Public API expected by LangGraph ---- #
-    def run(self, message: Any, state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Fetch new papers → return list[dict] for downstream agents."""
-        logger.info("FetcherAgent: querying sources…")
+    # ------------------------------------------------------------------ #
+    # LangGraph node interface
+    # ------------------------------------------------------------------ #
+    def run(self, _msg: Any, state: Dict[str, Any]):
+        """Return (list_of_new_paper_dicts, new_state)."""
         arxiv_items = self._fetch_arxiv()
         s2_items = self._fetch_semantic_scholar()
 
-        # Merge + dedup
-        combined: Dict[str, Dict[str, Any]] = {item["paper_id"]: item for item in arxiv_items}
-        for it in s2_items:
-            combined.setdefault(it["paper_id"], it)
+        combined: Dict[str, Dict[str, Any]] = {i["paper_id"]: i for i in arxiv_items}
+        for item in s2_items:
+            combined.setdefault(item["paper_id"], item)
 
         new_items = list(combined.values())
-        logger.info(f"FetcherAgent: {len(new_items)} new papers fetched.")
-
         self._persist(new_items)
+        return new_items, {**state, "last_fetch_ts": time.time()}
 
-        # Update agent state ➜ last_run timestamp
-        new_state = {**state, "last_fetch_ts": time.time()}
-        return new_items, new_state
-
-    # ---- Private helpers ---- #
+    # ------------------------------------------------------------------ #
+    # arXiv
+    # ------------------------------------------------------------------ #
     def _date_range(self) -> Tuple[str, str]:
         end = datetime.utcnow()
         start = end - timedelta(days=self.since_days)
@@ -100,80 +95,94 @@ class FetcherAgent:
             "sortBy": "submittedDate",
             "sortOrder": "descending",
         }
-        logger.debug(f"arXiv params: {params}")
         resp = requests.get(ARXIV_API, params=params, timeout=30)
         resp.raise_for_status()
-        # arXiv returns Atom XML; parse via regex for speed
+
         entries = re.findall(r"<entry>(.*?)</entry>", resp.text, re.S)
-        arxiv_ids, dois = _existing_ids()
+        arxiv_done, _ = _existing_ids()
         results: List[Dict[str, Any]] = []
         for entry in entries:
             id_match = re.search(r"<id>http://arxiv.org/abs/(.*?)</id>", entry)
             if not id_match:
                 continue
             aid = id_match.group(1)
-            if aid in arxiv_ids:
-                continue  # already processed
-            title = re.search(r"<title>(.*?)</title>", entry, re.S)
-            title_text = re.sub(r"\s+", " ", title.group(1).strip()) if title else ""
-            pdf_url = f"https://arxiv.org/pdf/{aid}.pdf"
-            doi_match = re.search(r"<arxiv:doi>(.*?)</arxiv:doi>", entry)
-            doi = doi_match.group(1) if doi_match else None
-            results.append({
-                "paper_id": f"arxiv:{aid}",
-                "title": title_text,
-                "doi": doi,
-                "source": "arXiv",
-                "pdf_url": pdf_url,
-            })
+            if aid in arxiv_done:
+                continue
+            title_tag = re.search(r"<title>(.*?)</title>", entry, re.S)
+            title = re.sub(r"\s+", " ", title_tag.group(1).strip()) if title_tag else ""
+            doi_tag = re.search(r"<arxiv:doi>(.*?)</arxiv:doi>", entry)
+            doi = doi_tag.group(1) if doi_tag else None
+            results.append(
+                {
+                    "paper_id": f"arxiv:{aid}",
+                    "title": title,
+                    "doi": doi,
+                    "source": "arXiv",
+                    "pdf_url": f"https://arxiv.org/pdf/{aid}.pdf",
+                }
+            )
+        logger.info("FetcherAgent: %d new arXiv papers", len(results))
         return results
 
+    # ------------------------------------------------------------------ #
+    # Semantic Scholar
+    # ------------------------------------------------------------------ #
     def _fetch_semantic_scholar(self) -> List[Dict[str, Any]]:
-        arxiv_ids, dois = _existing_ids()
         headers = {"x-api-key": self.s2_key} if self.s2_key else {}
         params = {
             "query": self.topic,
             "limit": self.max_results,
-            "fields": "title,authors,doi,url,year",
+            "offset": 0,
+            "fields": "title,authors,externalIds,url,year",
         }
-        resp = requests.get(S2_API, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp = requests.get(S2_API, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+        except HTTPError as err:
+            logger.warning("S2 fetch failed (%s); continuing with arXiv only", err)
+            return []
+
         data = resp.json().get("data", [])
+        _, dois_done = _existing_ids()
         results: List[Dict[str, Any]] = []
         for item in data:
-            doi = item.get("doi")
-            if not doi:
+            doi = (item.get("externalIds") or {}).get("DOI")
+            if not doi or doi in dois_done or not _DOI_RE.match(doi):
                 continue
-            if doi in dois:
-                continue
-            # Semantic Scholar doesn’t store PDFs; use url if PDF
-            pdf_url = item.get("url", "")
-            results.append({
-                "paper_id": doi,
-                "title": item.get("title", ""),
-                "doi": doi,
-                "source": "Semantic Scholar",
-                "pdf_url": pdf_url,
-            })
+            results.append(
+                {
+                    "paper_id": doi,
+                    "title": item.get("title", ""),
+                    "doi": doi,
+                    "source": "Semantic Scholar",
+                    "pdf_url": item.get("url", ""),
+                }
+            )
+        logger.info("FetcherAgent: %d new S2 papers", len(results))
         return results
 
+    # ------------------------------------------------------------------ #
+    # Persistence
+    # ------------------------------------------------------------------ #
     def _persist(self, items: List[Dict[str, Any]]):
         if not items:
             return
         with engine.begin() as conn:
             for it in items:
-                conn.execute(insert(papers).values(
-                    id=it["paper_id"],
-                    title=it["title"],
-                    summary="",  # placeholder for next agent
-                    embedding=json.dumps([]),
-                ))
-        logger.info(f"FetcherAgent: persisted {len(items)} rows to DB.")
+                conn.execute(
+                    insert(papers).values(
+                        id=it["paper_id"],
+                        title=it["title"],
+                        summary="",  # placeholder for summariser
+                        embedding=json.dumps([]),
+                    )
+                )
+        logger.info("FetcherAgent: persisted %d rows", len(items))
 
 
-# Quick CLI test
+# ----------------------------- CLI helper ------------------------------ #
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    fetcher = FetcherAgent(topic="ai safety", since_days=1, max_results=10)
-    papers_out, _ = fetcher.run(None, {})
-    print(json.dumps(papers_out, indent=2)[:1000])
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
+    f = FetcherAgent(topic="ai safety", since_days=1, max_results=15)
+    papers, _ = f.run(None, {})
+    print(json.dumps(papers[:5], indent=2))

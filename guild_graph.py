@@ -8,12 +8,6 @@ that occurs on current LangGraph versions ≥ 0.4.x.
 ```
 python guild_graph.py                # prints count + first titles
 ```
-
-### Next steps
-* Add `SummariserAgent`, then wire:
-    `builder.add_node("summarise", SummariserAgent(...).run)`
-    `builder.add_edge("fetch", "summarise")`
-* Keep the `GuildState` TypedDict up‑to‑date as more keys flow through.
 """
 
 from __future__ import annotations
