@@ -1,19 +1,19 @@
 # ui/app.py
 from __future__ import annotations
-import os, time, json, requests, pandas as pd, streamlit as st
-import ast
+import os, time, json, ast, requests, pandas as pd, streamlit as st
 
 # ------------------------------------------------------------------ #
 # Config
 # ------------------------------------------------------------------ #
-BACKEND = os.getenv("BACKEND", "http://localhost:8000")   # docker gives http://api:8000
+BACKEND = os.getenv("BACKEND", "http://localhost:8000")   # docker => http://api:8000
 
-# universal rerun helper (works on old / new Streamlit)
-def _rerun():
+
+def _rerun():        # universal rerun helper
     if hasattr(st, "rerun"):
         st.rerun()
     else:
         st.experimental_rerun()
+
 
 # ---------- tiny HTTP helpers ------------------------------------- #
 def fetch_status(job_id: str) -> dict:
@@ -24,12 +24,14 @@ def fetch_status(job_id: str) -> dict:
     except Exception as e:
         return {"status": "error", "logs": str(e)}
 
+
 def fetch_result(job_id: str) -> dict | None:
     try:
         r = requests.get(f"{BACKEND}/jobs/{job_id}/result", timeout=10)
         return r.json() if r.status_code == 200 else None
     except Exception:
         return None
+
 
 def fetch_jobs(status: str | None = "done") -> list[dict]:
     try:
@@ -57,34 +59,34 @@ with btn_clear_col:
 log_box = st.empty()
 
 # ------------------------------------------------------------------ #
-# Session keys
+# Session keys init
 # ------------------------------------------------------------------ #
 state = st.session_state
 for key in ("job_id", "ready", "results"):
     state.setdefault(key, None)
 
 # ------------------------------------------------------------------ #
-# Clear-data button
+# Clear-data
 # ------------------------------------------------------------------ #
 if clear_btn:
     r = requests.post(f"{BACKEND}/admin/clear")
     if r.status_code == 204:
         st.success("Tables cleared.")
         for k in ("job_id", "ready", "results"):
-            if k in state: state.pop(k)
+            state.pop(k, None)
         _rerun()
     else:
         st.error(f"Backend error: {r.status_code}")
 
 # ------------------------------------------------------------------ #
-# Run-pipeline button
+# Run pipeline
 # ------------------------------------------------------------------ #
 if run_btn:
     payload = {"topic": topic, "days": int(days), "max_results": int(max_p)}
     r = requests.post(f"{BACKEND}/jobs", json=payload)
     if r.status_code == 202:
         state.job_id = r.json()["job_id"]
-        state.ready  = None
+        state.ready = None
         state.results = None
         _rerun()
     else:
@@ -105,7 +107,7 @@ if job_id and not state.results:
 
     elif status["status"] == "done":
         if not state.ready:
-            state.ready = True      # first time we see done
+            state.ready = True
             _rerun()
         if st.button("📂 View Results"):
             res = fetch_result(job_id)
@@ -116,10 +118,10 @@ if job_id and not state.results:
     elif status["status"] == "failed":
         st.error(status.get("error", "Unknown backend error"))
 
-    st.stop()   # don’t show other sections while waiting / ready
+    st.stop()   # keep page minimal while waiting
 
 # ------------------------------------------------------------------ #
-# Past Jobs section
+# Past Jobs
 # ------------------------------------------------------------------ #
 jobs_done = fetch_jobs()
 if jobs_done:
@@ -131,14 +133,14 @@ if jobs_done:
         if c3.button("View Results", key=f"view-{j['id']}"):
             res = fetch_result(j["id"])
             if res:
-                state.job_id  = j["id"]
+                state.job_id = j["id"]
                 state.results = res
-                state.ready   = True
+                state.ready = True
                 _rerun()
     st.divider()
 
 # ------------------------------------------------------------------ #
-# Render results if present
+# Render results
 # ------------------------------------------------------------------ #
 if state.results:
     res = state.results
@@ -149,18 +151,15 @@ if state.results:
 
     # ---------- Trends ----------
     raw_trends = json.loads(res["trends_json"])
-
-    # legacy snapshots: each element may be a string that looks like a Python dict
     parsed = []
     for item in raw_trends:
         if isinstance(item, str):
             try:
-                parsed.append(ast.literal_eval(item))   # "{'trend_label': ...}" → dict
+                parsed.append(ast.literal_eval(item))
             except Exception:
-                continue                                # skip if it still can’t parse
+                continue
         elif isinstance(item, dict):
             parsed.append(item)
-
     tr_df = pd.DataFrame(parsed)
 
     papers_df = pd.DataFrame(json.loads(res["papers_json"]))
@@ -169,28 +168,21 @@ if state.results:
             papers_df[c] = pd.to_numeric(papers_df[c], errors="coerce")
 
     if not tr_df.empty and not papers_df.empty:
+        st.subheader("🔥 Trending topics (last 7 days)")
         for _, tr in tr_df.iterrows():
             label  = tr.get("trend_label") or tr.get("label") or "—"
             cnt    = int(tr.get("count", 0))
             growth = float(tr.get("growth", 0))
             ids_raw = tr.get("paper_ids", "[]")
-
-            # paper_ids is stored as JSON string
             try:
                 ids = json.loads(ids_raw) if isinstance(ids_raw, str) else ids_raw
             except Exception:
                 ids = []
             with st.expander(f"{label} — {cnt} papers ({'+' if growth>=0 else ''}{growth*100:.0f} %)"):
                 id_col = "id" if "id" in papers_df.columns else (
-                        "paper_id" if "paper_id" in papers_df.columns else None)
-
-                if id_col:
-                    group = papers_df[papers_df[id_col].isin(ids)].set_index(id_col)
-                    # re-order to match ids list, keeping only those found
-                    group = group.loc[[i for i in ids if i in group.index]]
-                else:
-                    # extreme fallback: nothing matches
-                    group = pd.DataFrame()
+                         "paper_id" if "paper_id" in papers_df.columns else None)
+                group = papers_df[papers_df[id_col].isin(ids)].set_index(id_col) if id_col else pd.DataFrame()
+                group = group.loc[[i for i in ids if i in group.index]]
                 for _, row in group.iterrows():
                     pid = row.name
                     if st.toggle(row.title, key=f"trend-{pid}"):
@@ -205,13 +197,31 @@ if state.results:
                         st.markdown("---")
         st.divider()
 
+    # ---------- 🔮 Future Improvements -----------------------
+    if "ideas_json" in res:
+        ideas_df = pd.DataFrame(json.loads(res["ideas_json"]))
+        if not ideas_df.empty and not papers_df.empty:
+            st.subheader("🔮 Future Improvements")
+            id_col = "id" if "id" in papers_df.columns else (
+                     "paper_id" if "paper_id" in papers_df.columns else None)
+            merged = ideas_df.merge(
+                papers_df[[id_col, "title"]],
+                left_on="paper_id", right_on=id_col, how="left"
+            ) if id_col else ideas_df
+            merged["title"].fillna(merged["paper_id"], inplace=True)
+            for pid, grp in merged.groupby("paper_id"):
+                paper_title = grp["title"].iloc[0] or pid
+                with st.expander(paper_title):
+                    for _, row in grp.sort_values("created_at", ascending=False).iterrows():
+                        st.markdown(row["ideas"])
+                        st.caption(row.get("created_at", "")[:19])
+            st.divider()
+    # ---------------------------------------------------------
+
     # ---------- Papers quick table ----------
     if not papers_df.empty:
         st.subheader("📄 All papers")
-
-        # choose safe columns that actually exist
         cols = [c for c in ("title", "created_at") if c in papers_df.columns]
-        if not cols:                          # fallback if both missing
-            cols = papers_df.columns[:2]      # show first two columns
-
+        if not cols:  # extreme fallback
+            cols = papers_df.columns[:2]
         st.dataframe(papers_df[cols])

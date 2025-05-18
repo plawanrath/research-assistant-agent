@@ -1,4 +1,4 @@
-from sqlalchemy import String, create_engine, Table, Column, Text, MetaData, DateTime, Integer, Float
+from sqlalchemy import String, create_engine, Table, Column, Text, MetaData, DateTime, Integer, Float, ForeignKey
 from datetime import datetime, timezone
 import pathlib
 
@@ -65,6 +65,15 @@ results = Table(
     Column("reading_plan", Text),
     Column("trends_json", Text),
     Column("papers_json", Text),
+    Column("ideas_json",  Text), 
+)
+
+future_ideas = Table(
+    "future_ideas", meta,
+    Column("id",        Integer, primary_key=True),
+    Column("paper_id",  Text,    ForeignKey("papers.id")),
+    Column("ideas",     Text),
+    Column("created_at",DateTime, default=datetime.now(timezone.utc)),
 )
 
 meta.create_all(engine)

@@ -59,10 +59,15 @@ def pipeline_task(self, job_id: str, topic: str, days: int, max_results: int):
                     "FROM papers ORDER BY created_at"
                 )
             ).mappings().all()
+            ideas_rows = conn.execute(
+                text("SELECT paper_id, ideas, created_at FROM future_ideas WHERE rowid IN "
+                    "(SELECT MAX(rowid) FROM future_ideas GROUP BY paper_id)")
+            ).mappings().all()
 
         # serialise to JSON
         trends_json = json.dumps([dict(r) for r in trends])
         papers_json = json.dumps([dict(r) for r in papers])
+        ideas_json = json.dumps([dict(r) for r in ideas_rows], default=str)
 
         # ------------------------------------------------------------------
         # store snapshot + mark job done
@@ -74,6 +79,7 @@ def pipeline_task(self, job_id: str, topic: str, days: int, max_results: int):
                     reading_plan=plan or "",
                     trends_json=trends_json,
                     papers_json=papers_json,
+                    ideas_json=ideas_json,
                 )
             )
             conn.execute(
