@@ -39,11 +39,11 @@ research-guild/
 ## How to Run
 
 ```
-git clone https://github.com/you/research-guild.git
-cd research-guild
+git clone https://github.com/plawanrath/research-assistant-agent.git
+cd research-assistant-agent
 
 # 1. secrets
-cp .env.example .env           # add your OPENAI_API_KEY, optional REDIS_URL
+touch .env           # add your OPENAI_API_KEY, optional REDIS_URL
 
 # 2. make data dir (git-ignored)
 mkdir -p data
