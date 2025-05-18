@@ -76,6 +76,13 @@ future_ideas = Table(
     Column("created_at",DateTime, default=datetime.now(timezone.utc)),
 )
 
+users = Table(
+    "users", meta,
+    Column("id", Integer, primary_key=True),
+    Column("username", String, unique=True, nullable=False),
+    Column("pwd_hash", String, nullable=False),
+)
+
 meta.create_all(engine)
 
 # helper for tasks

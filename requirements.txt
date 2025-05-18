@@ -18,3 +18,4 @@ celery[redis]
 pydantic
 aiofiles
 requests
+bcrypt

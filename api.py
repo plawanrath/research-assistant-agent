@@ -1,12 +1,24 @@
 # api.py  – FastAPI server
+import os
 import uuid, datetime as dt, json
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, text, desc
 from services.storage import engine, jobs, logs, results
 from tasks import pipeline_task
 
-app = FastAPI()
+app = FastAPI(title="Research Assistant")
+
+_ALLOWED = os.getenv("CORS_ORIGINS", "").split(",") or ["*"]   # * = wide-open
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ALLOWED,           # e.g. ["https://app.your-domain.com"]
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
 def _row_to_dict(row):
     return dict(row._mapping)

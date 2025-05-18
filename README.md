@@ -54,3 +54,14 @@ docker compose up --build
 
 - UI: http://localhost:8501
 - API: API: http://localhost:8000 
+
+## Creating User
+
+```
+python - <<'PY'                             
+import bcrypt, sqlalchemy as sa, services.storage as s
+pwd = bcrypt.hashpw(b"<password>", bcrypt.gensalt()).decode()
+with s.engine.begin() as conn:
+    conn.execute(sa.insert(s.users).values(username="<username>", pwd_hash=pwd))
+PY
+```
