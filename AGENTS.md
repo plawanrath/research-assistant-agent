@@ -23,7 +23,7 @@ We can create a .env file to store the API keys. This should be added to gitigno
     - BeautifulSoup / Scrapy: For web scraping tasks.
     - PyPDF2 / pdfminer.six: For extracting text from PDF documents.
 5. Data Storage
-    - Postgres: Lightweight database for storing metadata and summaries.
+    - sqllite: Lightweight database for storing metadata and summaries.
     - Pinecone / FAISS: For vector-based similarity search and trend analysis.
 6. User Interface
     - Streamlit: Rapid development of interactive web applications.

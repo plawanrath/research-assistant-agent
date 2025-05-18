@@ -1,0 +1,9 @@
+langgraph 
+crewai 
+openai 
+streamlit 
+faiss-cpu 
+pypdf 
+pymupdf 
+tiktoken 
+sqlalchemy
