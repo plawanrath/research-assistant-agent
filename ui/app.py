@@ -13,9 +13,12 @@ st.markdown(
     """
     <style>
       html, body, .main {height:100%;}
-      div.center-box {display:flex; justify-content:center; align-items:center; height:85vh;}
       div.login-card {border:1px solid #ddd; padding:2rem 3rem; border-radius:10px;
-                      box-shadow:2px 2px 6px rgba(0,0,0,0.05); width:340px;}
+                      box-shadow:2px 2px 6px rgba(0,0,0,0.05); width:340px;
+                      margin:1.5rem auto;}
+      button.logout {background:#f44336;color:#fff;border:none;padding:0.35rem 0.9rem;
+                     border-radius:5px;font-size:0.85rem;cursor:pointer;}
+      p.hint {font-size:0.85rem;color:#666;margin-top:0.8rem;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -29,7 +32,6 @@ for k in ("job_id", "ready", "results"):
 
 # ───────────────────────── Login gate ─────────── #
 if not state.logged_in:
-    # st.markdown('<div class="login-card">', unsafe_allow_html=True)
     st.markdown("## Research Assistant Login", unsafe_allow_html=True)
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
@@ -39,7 +41,22 @@ if not state.logged_in:
             _rerun()
         else:
             st.error("Login failed – wrong credentials.")
-    # st.markdown('</div>', unsafe_allow_html=True)
+
+    # extra helper lines
+    st.markdown(
+        """
+        <p class="hint">For access please email <strong>plawanrath@gmail.com</strong></p>
+        <p class="hint">
+          The agent is available open-source in
+          <a href="https://github.com/plawanrath/research-assistant-agent.git" target="_blank">
+            this&nbsp;repo
+          </a>.
+        </p>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.stop()
     st.stop()      # 🚧 nothing below until logged-in
 
 # ───────────────────────── Logout top-left ──────────────────────── #
