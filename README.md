@@ -1,5 +1,7 @@
 Research Assistant Agent
 
+**DO NOT RUN THIS LOCALLY. IT WILL FAIL. USE THE OPEN SOURCE MAIN BRANCH**
+
 ```
                 ┌───────────────┐
    text_input → │  Streamlit UI │─┐

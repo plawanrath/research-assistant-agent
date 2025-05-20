@@ -1,46 +1,104 @@
-version: "3.9"
-
-# docker-compose automatically loads .env at the project root
 services:
   redis:
     image: redis:7-alpine
+    networks: [net]
     restart: unless-stopped
+
+  traefik:
+    image: traefik:v2.11
+    networks: [net]
+    restart: unless-stopped
+    command:
+      # ── core ────────────────────────────────
+      - "--log.level=DEBUG"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=net"
+
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+
+      # ── Let’s Encrypt resolver “le” ─────────
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${LE_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./letsencrypt:/letsencrypt"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    environment:
+      - DOMAIN=${DOMAIN}
+    labels:
+      # expose Traefik dashboard on /dashboard (optional)
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik.rule=Host(`${DOMAIN}`) && (Path(`/dashboard`) || PathPrefix(`/api`))"
+      - "traefik.http.routers.traefik.entrypoints=websecure"
+      - "traefik.http.routers.traefik.tls.certresolver=le"
+      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
 
   api:
     build: .
+    networks: [net]
     env_file: .env
     environment:
       - REDIS_URL=${REDIS_URL}
       - CORS_ORIGINS=${CORS_ORIGINS}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
-      - ./data:/app/data          # ← mount directory
+      - ./data:/app/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.api.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls.certresolver=le"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
     depends_on: [redis]
-    ports:
-      - "8000:8000"
 
   worker:
     build: .
     command: celery -A tasks.celery_app worker --loglevel=info
+    networks: [net]
     env_file: .env
     environment:
       - REDIS_URL=${REDIS_URL}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
-      - ./data:/app/data          # ← same mount
+      - ./data:/app/data
     depends_on: [redis, api]
 
   streamlit:
     build: .
-    command: >
-      streamlit run ui/app.py
-      --server.port=8501
-      --server.address=0.0.0.0
+    networks: [net]
+    command: streamlit run ui/app.py --server.port=8501 --server.address=0.0.0.0
     env_file: .env
     environment:
-      - BACKEND=${BACKEND_URL:-http://api:8000}
+      - BACKEND=${BACKEND_URL}
     volumes:
-      - ./data:/app/data          # ← so UI can read the DB if needed
+      - ./data:/app/data
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.ui.entrypoints=websecure"
+
+      # ①  MATCH BOTH HOSTNAMES
+      - "traefik.http.routers.ui.rule=Host(`${DOMAIN}`, `www.${DOMAIN}`)"
+
+      # ②  USE THE LE CERT RESOLVER
+      - "traefik.http.routers.ui.tls.certresolver=le"
+
+      # ③  ISSUE A CERT THAT COVERS BOTH NAMES
+      - "traefik.http.routers.ui.tls.domains[0].main=${DOMAIN}"
+      - "traefik.http.routers.ui.tls.domains[0].sans=www.${DOMAIN}"
+
+      # ④  PASS TRAFFIC TO THE STREAMLIT CONTAINER
+      - "traefik.http.services.ui.loadbalancer.server.port=8501"
     depends_on: [api]
-    ports:
-      - "8501:8501"
+
+networks:
+  net:
+    driver: bridge

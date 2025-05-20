@@ -1,6 +1,13 @@
 from __future__ import annotations
 import os, time, json, ast, requests, pandas as pd, streamlit as st
 
+# ── Page metadata (must be the first Streamlit call) ────────────
+st.set_page_config(
+    page_title="Research Assistant",   # what shows in the browser tab
+    page_icon="🔎",                    # optional favicon / emoji
+    layout="wide"                      # optional – keeps your current layout
+)
+
 # ───────────────────────── Config ────────────────────────── #
 BACKEND = os.getenv("BACKEND", "http://localhost:8000")     # docker ⇒ http://api:8000
 from services.auth import verify                            # bcrypt password check
